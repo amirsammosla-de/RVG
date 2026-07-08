@@ -3,6 +3,7 @@ import json
 import os
 import hashlib
 import secrets
+import sys
 import time
 import aiofiles
 from datetime import datetime, timedelta
@@ -25,12 +26,6 @@ IRAN_TZ = ZoneInfo("Asia/Tehran")
 
 app = FastAPI(title="RVG Gateway - codebox", docs_url=None, redoc_url=None)
 
-CONFIG = {
-    "port": int(os.environ.get("PORT", 8000)),
-    "secret": os.environ.get("SECRET_KEY", secrets.token_urlsafe(32)),
-    "host": os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost"),
-}
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -42,7 +37,42 @@ app.add_middleware(
 # ── Persistence ───────────────────────────────────────────────────────────────
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 DATA_FILE = DATA_DIR / "rvg_state.json"
+SECRET_FILE = DATA_DIR / ".rvg_secret"
 SAVE_LOCK = asyncio.Lock()
+
+
+def _get_or_create_secret() -> str:
+    """
+    اولویت با SECRET_KEY محیطی است (اگر دستی ست شده باشد).
+    در غیر این صورت، یک secret را فقط یک‌بار می‌سازد و در یک فایل
+    روی دیسک دائمی (DATA_DIR) ذخیره می‌کند تا در ری‌استارت‌های بعدی
+    (چه توسط آپدیتر با execv، چه ری‌دیپلوی Railway) همیشه همان مقدار
+    خوانده شود و هش رمز عبور / سشن‌ها نامعتبر نشوند.
+    """
+    env_secret = os.environ.get("SECRET_KEY")
+    if env_secret:
+        return env_secret
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if SECRET_FILE.exists():
+            val = SECRET_FILE.read_text(encoding="utf-8").strip()
+            if val:
+                return val
+        new_secret = secrets.token_urlsafe(32)
+        SECRET_FILE.write_text(new_secret, encoding="utf-8")
+        logger.info("SECRET_KEY جدید ساخته و در دیسک ذخیره شد (پایدار بین ری‌استارت‌ها).")
+        return new_secret
+    except Exception as e:
+        logger.warning(f"عدم امکان ذخیره‌ی SECRET_KEY روی دیسک: {e} — از مقدار موقت استفاده می‌شود.")
+        return secrets.token_urlsafe(32)
+
+
+CONFIG = {
+    "port": int(os.environ.get("PORT", 8000)),
+    "secret": _get_or_create_secret(),
+    "host": os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost"),
+}
+
 
 async def load_state():
     global LINKS, AUTH, SUBS
@@ -159,7 +189,7 @@ async def startup():
     )
     await load_state()
     log_activity("system", "سرور راه‌اندازی شد", "ok")
-    logger.info(f"RVG Gateway v9.1 started on port {CONFIG['port']}")
+    logger.info(f"RVG Gateway v9.2 started on port {CONFIG['port']}")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -289,7 +319,7 @@ async def ensure_default_link():
 # ── Basic endpoints ───────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "RVG Gateway", "version": "9.1", "status": "active", "channel": "https://t.me/CodeBoxo"}
+    return {"service": "RVG Gateway", "version": "9.2", "status": "active", "channel": "https://t.me/CodeBoxo"}
 
 @app.get("/health")
 async def health():
@@ -838,6 +868,86 @@ async def public_sub_data(uuid_key: str, request: Request):
         "total_used_fmt": fmt_bytes(total_used),
         "links": links_out,
     }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Version / Auto-Update
+# ══════════════════════════════════════════════════════════════════════════════
+from updater import (
+    get_current_version, get_current_version_info,
+    get_latest_version_info, perform_update,
+    update_log, update_state, load_update_history,
+    REPO, BRANCH, is_newer_version,
+)
+
+@app.get("/api/version")
+async def api_version(_=Depends(require_auth)):
+    current_info = get_current_version_info()
+    latest_info = await get_latest_version_info()
+    latest_ver = latest_info.get("version")
+    update_available = is_newer_version(latest_ver, current_info["version"]) if latest_ver else False
+    return {
+        "repo": REPO,
+        "branch": BRANCH,
+        "current": current_info,
+        "latest": latest_info,
+        "update_available": update_available,
+    }
+
+@app.get("/api/update-history")
+async def api_update_history(_=Depends(require_auth)):
+    return {"history": load_update_history()}
+
+@app.get("/api/update-log")
+async def api_update_log(_=Depends(require_auth)):
+    return {"running": update_state["running"], "progress": update_state["progress"], "logs": list(update_log)[-100:]}
+
+@app.post("/api/update")
+async def api_update(_=Depends(require_auth)):
+    if update_state["running"]:
+        raise HTTPException(status_code=409, detail="بروزرسانی در حال اجراست")
+
+    update_log.append({"time": time.time(), "msg": "درخواست بروزرسانی ثبت شد، در صف اجرا..."})
+
+    async def _run():
+        ok = False
+        try:
+            ok = await perform_update()
+        except Exception as exc:
+            import traceback as tb
+            update_log.append({"time": time.time(), "msg": f"❌ خطای بحرانی: {exc}"})
+            update_log.append({"time": time.time(), "msg": tb.format_exc()[-800:]})
+            update_state["running"] = False
+        try:
+            await save_state()
+            log_activity("system", "بروزرسانی پنل " + ("موفق" if ok else "ناموفق") + " بود", "ok" if ok else "err")
+        except Exception:
+            pass
+
+        if ok:
+            update_log.append({"time": time.time(), "msg": "در حال راه‌اندازی مجدد پروسه (بدون خاموش‌شدن کانتینر)..."})
+            await asyncio.sleep(1.5)
+            try:
+                # پروسه رو با همون PID دوباره از صفر اجرا می‌کنه؛
+                # برخلاف os._exit، کانتینر رو نمی‌کشه و نیازی به
+                # ری‌استارت خارجی (Railway) نداره.
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+            except Exception as exc:
+                update_log.append({"time": time.time(), "msg": f"❌ execv شکست خورد: {exc} — fallback به exit"})
+                os._exit(0)
+
+    task = asyncio.create_task(_run())
+
+    def _on_done(t: asyncio.Task):
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc:
+            update_log.append({"time": time.time(), "msg": f"❌ Task crash: {exc}"})
+            update_state["running"] = False
+
+    task.add_done_callback(_on_done)
+    log_activity("system", "درخواست بروزرسانی پنل ثبت شد", "info")
+    return {"ok": True, "started": True}
 
 # ── HTML Pages (login + dashboard) ───────────────────────────────────────────
 from pages import LOGIN_HTML, DASHBOARD_HTML
